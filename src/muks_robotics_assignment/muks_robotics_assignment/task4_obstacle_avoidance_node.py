@@ -10,19 +10,19 @@ Single responsibility:
 
 import math
 from bisect import bisect_right
-from typing import List
+from typing import List, Optional
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry, Path
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import JointState, LaserScan
 from std_msgs.msg import Float64
 from tf2_ros import TransformBroadcaster
 from trajectory_msgs.msg import MultiDOFJointTrajectory
 from visualization_msgs.msg import Marker, MarkerArray
-from sensor_msgs.msg import JointState  
+
 from muks_robotics_assignment.common_types import Point2D, ReferenceState, TrajectoryPoint2D
 from muks_robotics_assignment.geometry_utils import distance, normalize_angle, yaw_from_quaternion
 from muks_robotics_assignment.obstacle_avoidance import (
@@ -102,10 +102,10 @@ class Task4ObstacleAvoidanceNode(Node):
         self.declare_parameter('obstacle_detection_range', 3.5)
         self.declare_parameter('obstacle_inflation_radius', 0.35)
         self.declare_parameter('avoidance_margin', 0.20)
-        self.declare_parameter('avoidance_lookahead_points', 60)
+        self.declare_parameter('avoidance_lookahead_points', 30)
         self.declare_parameter('avoidance_forward_points', 45)
-        self.declare_parameter('avoidance_replan_cooldown_sec', 0.8)
-        self.declare_parameter('avoidance_lateral_offsets', [-1.0, -0.8, -0.6, 0.6, 0.8, 1.0])
+        self.declare_parameter('avoidance_replan_cooldown_sec', 2.5)
+        self.declare_parameter('avoidance_lateral_offsets', [-0.55, -0.85, 0.55, 0.85, -1.10, 1.10])
         self.declare_parameter('publish_joint_states', True)
         self.declare_parameter(
             'wheel_joint_names',
@@ -143,6 +143,7 @@ class Task4ObstacleAvoidanceNode(Node):
         self.external_path_is_smoothed = bool(self.get_parameter('external_path_is_smoothed').value)
         self.wait_for_external_path = bool(self.get_parameter('wait_for_external_path').value)
         self.publish_joint_states = bool(self.get_parameter('publish_joint_states').value)
+
         wheel_joint_names = list(self.get_parameter('wheel_joint_names').value)
         if len(wheel_joint_names) < 2:
             wheel_joint_names = ['wheel_left_joint', 'wheel_right_joint']
@@ -271,6 +272,8 @@ class Task4ObstacleAvoidanceNode(Node):
         self.robot_x = self.raw_waypoints[0][0] + self.start_offset_x
         self.robot_y = self.raw_waypoints[0][1] + self.start_offset_y
         self.robot_yaw = self.start_offset_yaw
+
+        self._avoidance_start_delay_sec = 2.0
 
         self.external_path_received = not self.use_external_path
         self._last_external_points: List[Point2D] = []
@@ -484,21 +487,153 @@ class Task4ObstacleAvoidanceNode(Node):
         self.scan_received = True
 
     # ------------------------------------------------------------------
-    # Planning and Control
+    # Replanning helpers
+    # ------------------------------------------------------------------
+    def _point_to_segment_distance(self, p: Point2D, a: Point2D, b: Point2D) -> float:
+        px, py = p
+        ax, ay = a
+        bx, by = b
+
+        vx, vy = bx - ax, by - ay
+        wx, wy = px - ax, py - ay
+        seg_len_sq = vx * vx + vy * vy
+
+        if seg_len_sq < 1e-9:
+            return distance(p, a)
+
+        t = max(0.0, min(1.0, (wx * vx + wy * vy) / seg_len_sq))
+        proj = (ax + t * vx, ay + t * vy)
+        return distance(p, proj)
+
+    def _path_is_clear(self, path_xy: List[Point2D], obstacles: List[Point2D], clearance: float) -> bool:
+        if len(path_xy) < 2:
+            return False
+        for obs in obstacles:
+            for i in range(len(path_xy) - 1):
+                if self._point_to_segment_distance(obs, path_xy[i], path_xy[i + 1]) < clearance:
+                    return False
+        return True
+
+    def _densify_polyline(self, pts: List[Point2D], step: float) -> List[Point2D]:
+        if len(pts) < 2:
+            return list(pts)
+
+        dense: List[Point2D] = [pts[0]]
+        step = max(step, 1e-3)
+
+        for a, b in zip(pts, pts[1:]):
+            seg_len = distance(a, b)
+            n = max(1, int(math.ceil(seg_len / step)))
+            for i in range(1, n + 1):
+                t = i / n
+                dense.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
+
+        return dense
+
+    def _path_direction_and_normal(self, current_idx: int, blocked_idx: int) -> Optional[tuple]:
+        rejoin_idx = min(blocked_idx + self.avoidance_forward_points, len(self.trajectory_xy) - 1)
+        if rejoin_idx <= current_idx + 2:
+            return None
+
+        a_idx = max(current_idx, blocked_idx - max(3, self.avoidance_lookahead_points // 4))
+        a = self.trajectory_xy[a_idx]
+        b = self.trajectory_xy[rejoin_idx]
+
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        norm = math.hypot(dx, dy)
+        if norm < 1e-6:
+            return None
+
+        tx, ty = dx / norm, dy / norm
+        nx, ny = -ty, tx
+        return (rejoin_idx, tx, ty, nx, ny)
+
+    def _build_stronger_detour_path(self, current_idx: int, blocked_idx: int) -> List[Point2D]:
+        """
+        Construct a wider bypass around the obstacle cluster and rejoin farther ahead.
+        This is more aggressive than the default local detour and is meant to avoid
+        the "small offset but still clipped the obstacle" failure.
+        """
+        info = self._path_direction_and_normal(current_idx, blocked_idx)
+        if info is None:
+            return []
+
+        rejoin_idx, tx, ty, nx, ny = info
+        start = (self.robot_x, self.robot_y)
+        pre_idx = max(current_idx + 1, blocked_idx - max(2, self.avoidance_lookahead_points // 5))
+        pre_anchor = self.trajectory_xy[pre_idx]
+        rejoin_anchor = self.trajectory_xy[rejoin_idx]
+
+        clearance = self.obstacle_inflation_radius + self.avoidance_margin
+        cluster: List[Point2D] = []
+        for obs in self.obstacle_points_world:
+            if self._point_to_segment_distance(obs, pre_anchor, rejoin_anchor) < (clearance * 2.5):
+                cluster.append(obs)
+
+        if cluster:
+            cx = sum(p[0] for p in cluster) / len(cluster)
+            cy = sum(p[1] for p in cluster) / len(cluster)
+        else:
+            cx, cy = rejoin_anchor
+
+        # We will try both sides and increasing offsets.
+        offsets = [
+            clearance * 2.0,
+            clearance * 2.6,
+            clearance * 3.2,
+            clearance * 4.0,
+        ]
+
+        candidates: List[List[Point2D]] = []
+
+        for side in (-1.0, 1.0):
+            for off in offsets:
+                side_off = side * off
+
+                # Push the path away from the obstacle cluster in the normal direction.
+                pre = (pre_anchor[0] + nx * side_off, pre_anchor[1] + ny * side_off)
+
+                # Add a mid point around the cluster center, also offset to the same side.
+                around = (cx + nx * side_off, cy + ny * side_off)
+
+                # Put the rejoin point later on the same offset line.
+                rejoin = (rejoin_anchor[0] + nx * side_off, rejoin_anchor[1] + ny * side_off)
+
+                # Small forward push helps avoid sharp corners.
+                exit_pt = (rejoin[0] + tx * clearance, rejoin[1] + ty * clearance)
+
+                candidate = [start, pre, around, exit_pt, rejoin_anchor]
+                candidate = self._densify_polyline(candidate, self.trajectory_sample_distance)
+                candidates.append(candidate)
+
+        for candidate in candidates:
+            if self._path_is_clear(candidate, self.obstacle_points_world, clearance):
+                return candidate
+
+        return []
+
+    # ------------------------------------------------------------------
+    # Planning and control
     # ------------------------------------------------------------------
     def _maybe_replan_for_obstacles(self, now) -> None:
+        if self.start_time is None:
+            return
+
+        elapsed = (now - self.start_time).nanoseconds * 1e-9
+        if elapsed < self._avoidance_start_delay_sec:
+            return
         if not self.use_obstacle_avoidance:
             return
         if not self.scan_received or not self.obstacle_points_world:
             return
-        if len(self.trajectory_xy) < 5 or self.start_time is None:
+        if len(self.trajectory_xy) < 5:
             return
 
         now_sec = now.nanoseconds * 1e-9
         if (now_sec - self.last_replan_time_sec) < self.avoidance_replan_cooldown_sec:
             return
 
-        elapsed = (now - self.start_time).nanoseconds * 1e-9
         current_idx = max(0, bisect_right(self.trajectory_times, elapsed) - 1)
         clearance = self.obstacle_inflation_radius + self.avoidance_margin
 
@@ -512,16 +647,23 @@ class Task4ObstacleAvoidanceNode(Node):
         if blocked_idx is None:
             return
 
-        self.last_replan_time_sec = now_sec
-        detour_path = build_detour_path(
-            robot_xy=(self.robot_x, self.robot_y),
-            trajectory_xy=self.trajectory_xy,
-            current_idx=current_idx,
-            blocked_idx=blocked_idx,
-            obstacles=self.obstacle_points_world,
-            cfg=self.avoidance_cfg,
-            samples_per_segment=self.samples_per_segment,
-        )
+        # First try the stronger local detour.
+        detour_path = self._build_stronger_detour_path(current_idx, blocked_idx)
+
+        # If that fails, fall back to the package helper.
+        if not detour_path:
+            detour_path = build_detour_path(
+                robot_xy=(self.robot_x, self.robot_y),
+                trajectory_xy=self.trajectory_xy,
+                current_idx=current_idx,
+                blocked_idx=blocked_idx,
+                obstacles=self.obstacle_points_world,
+                cfg=self.avoidance_cfg,
+                samples_per_segment=self.samples_per_segment,
+            )
+            if detour_path:
+                detour_path = self._densify_polyline(detour_path, self.trajectory_sample_distance)
+
         if not detour_path:
             self.get_logger().warn('Obstacle detected, but no safe detour candidate found.')
             return
@@ -534,6 +676,9 @@ class Task4ObstacleAvoidanceNode(Node):
         self._set_active_trajectory(new_trajectory)
         self.avoidance_path_xy = detour_path
         self.avoidance_replan_count += 1
+        self.last_replan_time_sec = now_sec
+
+        # Restart timing cleanly from the current robot pose.
         self.start_time = now
         self.last_control_time = now
         self.tracking_finished = False
@@ -587,7 +732,7 @@ class Task4ObstacleAvoidanceNode(Node):
                 self.robot_y += v_cmd * math.sin(self.robot_yaw) * dt
                 self.robot_yaw = normalize_angle(self.robot_yaw + w_cmd * dt)
 
-            if distance(self.tracked_path_xy[-1], (self.robot_x, self.robot_y)) > 0.01:
+            if len(self.tracked_path_xy) == 0 or distance(self.tracked_path_xy[-1], (self.robot_x, self.robot_y)) > 0.01:
                 self.tracked_path_xy.append((self.robot_x, self.robot_y))
 
             pos_error = distance((reference.x, reference.y), (self.robot_x, self.robot_y))
@@ -631,14 +776,9 @@ class Task4ObstacleAvoidanceNode(Node):
         err_msg.data = float(self.last_pos_error)
         self.tracking_error_pub.publish(err_msg)
 
-        
     def _publish_wheel_joint_states(self, stamp, v_cmd: float, w_cmd: float, dt: float) -> None:
         """
         Calculates and publishes how much each wheel has rotated.
-        
-        We use the commanded linear and angular velocities to estimate wheel speeds 
-        (using differential drive math). We do this just so the 3D robot model in RViz 
-        has spinning wheels, making the simulation look realistic.
         """
         if self.joint_state_pub is None:
             return
@@ -656,6 +796,7 @@ class Task4ObstacleAvoidanceNode(Node):
         js.name = list(self.wheel_joint_names)
         js.position = []
         js.velocity = []
+
         for idx, name in enumerate(self.wheel_joint_names):
             lname = name.lower()
             if 'left' in lname:
@@ -670,7 +811,9 @@ class Task4ObstacleAvoidanceNode(Node):
             else:
                 js.position.append(self.right_wheel_pos)
                 js.velocity.append(w_right)
+
         self.joint_state_pub.publish(js)
+
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------

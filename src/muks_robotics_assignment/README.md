@@ -5,7 +5,7 @@ This package contains my full solution for:
 1. Path smoothing from sparse waypoints
 2. Trajectory generation (time-parameterized path)
 3. Trajectory tracking controller
-4. Obstacle-aware local replanning using `/scan` (extra task)
+4. Obstacle-aware local replanning using `/scan` (extra task) (I have some little bugs that needs to be fixed)
 
 The implementation is done as a ROS 2 Python package with separate task nodes and shared algorithm modules.
 
@@ -50,8 +50,6 @@ ros2 run muks_robotics_assignment task2_trajectory_generation_node
 # Task 3: Trajectory tracking
 ros2 run muks_robotics_assignment task3_trajectory_tracking_node
 
-# Task 4: Obstacle-aware tracking
-ros2 run muks_robotics_assignment task4_obstacle_avoidance_node
 
 # All-in-one integrated node
 ros2 run muks_robotics_assignment path_smoothing_node
@@ -69,7 +67,7 @@ Optional launch args:
 ros2 launch muks_robotics_assignment tasks_1_2_3.launch.py frame_id:=odom use_sim_time:=false
 ```
 
-### Interactive RViz Demo Flow 
+### Interactive RViz Demo Flow
 
 1. Start node:
    `ros2 run muks_robotics_assignment interactive_path_smoothing_node`
@@ -166,7 +164,7 @@ The main intention was to keep it modular and evaluation-friendly:
 - Added feasibility handling so reference timing does not exceed tracking speed limits
 - Added TF and joint-state publication for consistent RobotModel visualization in RViz
 
-#### Task 4: Obstacle Avoidance
+#### Extra : Obstacle Avoidance ( Have some little Bugs that need to be fixed)
 
 - LaserScan points are projected into world frame
 - A local lookahead window checks whether active trajectory is blocked
